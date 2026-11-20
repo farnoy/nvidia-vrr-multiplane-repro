@@ -14,12 +14,22 @@ const USAGE: &str = "\
 Usage: drm-plane-bench [options]
   --suite                run the 6-case ~42 s test suite and print a Markdown
                          report (recommended)
+  --regression           run the --suite cases plus 5 regression cases (overlay
+                         move, overlay move --exclusive, cursor swap, cursor-only
+                         idle, VRR off control); ~77 s, same Markdown report
+  --dual-head            run 4 cases updating two active CRTCs of one device in the
+                         same atomic commit (VRR+VRR flips, flip+cursor both ways,
+                         VRR+fixed); ~28 s, Markdown report; sets VRR per case
+  --connector-b NAME     second head for --dual-head (default: the next active CRTC
+                         on the same device)
   --list                 list detected GPUs, active displays and VRR capability
                          (safe to run inside a graphical session)
   --device PATH          DRM device (default: auto-detect, preferring vrr_capable=1)
-  --connector NAME       e.g. HDMI-A-1, DP-1 (default: first connected active CRTC)
+  --connector NAME       e.g. HDMI-A-1, DP-1 (default: first connected active CRTC;
+                         head A in --dual-head)
   --vrr on|off|keep      VRR_ENABLED for the run (default on); restored at exit
-  --pace-hz HZ           primary flip rate cap (default: 83% of refresh in --suite,
+  --pace-hz HZ           primary flip rate cap (default: 83% of refresh in --suite
+                         and --regression, of the slower head in --dual-head;
                          97.5% in single-run mode)
   --overlay-every K      update the secondary plane every K frames (default 8)
   --overlay-size WxH     overlay size (default 512x128)
@@ -40,7 +50,8 @@ Usage: drm-plane-bench [options]
   --pattern-on N         px of foreground per period (default 3)
   --pattern-fg RRGGBB    foreground (default 30c030), --pattern-bg RRGGBB (default 101010)
   --pattern-rect X,Y,W,H region (default: the graph band at the bottom)
-  --seconds S            run length (default: 7 per case in --suite, 30 single-run)
+  --seconds S            run length (default: 7 per case in --suite, --regression
+                         and --dual-head; 30 single-run)
   --csv PATH             per-frame CSV output (single-run mode; default: none)
 
 Run from a spare VT with no compositor holding DRM master (it needs SET_MASTER).
@@ -439,42 +450,111 @@ fn plane_geometry(plane: &Plane, crtc: u32, fb: u32, w: u32, h: u32, x: u32, y: 
     PLANE_PROPS.iter().zip(values).map(|(name, v)| Ok((plane.prop(name)?, v))).collect()
 }
 
+enum EventPoll {
+    Read,
+    TimedOut,
+    Stopped,
+}
+
+/// Waits up to 200 ms for DRM events and passes each flip completion to
+/// `on_flip(user_data, crtc_id, CLOCK_MONOTONIC ns)`.
+fn read_flip_events(file: &mut File, mut on_flip: impl FnMut(u64, u32, u64)) -> Result<EventPoll> {
+    let mut pfd = libc::pollfd { fd: file.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    let ready = unsafe { libc::poll(&mut pfd, 1, 200) };
+    if ready < 0 {
+        let e = io::Error::last_os_error();
+        if e.kind() == io::ErrorKind::Interrupted && STOP.load(Ordering::Relaxed) {
+            return Ok(EventPoll::Stopped);
+        }
+        return Err(e.into());
+    }
+    if ready == 0 {
+        return Ok(EventPoll::TimedOut);
+    }
+    let mut buf = [0u8; 1024];
+    let n = file.read(&mut buf)?;
+    let mut offset = 0;
+    while offset + size_of::<drm_event>() <= n {
+        let header: drm_event = unsafe { std::ptr::read_unaligned(buf[offset..].as_ptr().cast()) };
+        if header.type_ == FLIP_COMPLETE && offset + size_of::<drm_event_vblank>() <= n {
+            let e: drm_event_vblank = unsafe { std::ptr::read_unaligned(buf[offset..].as_ptr().cast()) };
+            on_flip(e.user_data, e.crtc_id, e.tv_sec as u64 * 1_000_000_000 + e.tv_usec as u64 * 1000);
+        }
+        offset += header.length.max(8) as usize;
+    }
+    Ok(EventPoll::Read)
+}
+
 /// Blocks until the flip event carrying `cookie` arrives; returns its CLOCK_MONOTONIC ns.
 fn wait_flip(file: &mut File, cookie: u64) -> Result<Option<u64>> {
-    let mut buf = [0u8; 1024];
-    loop {
-        let mut pfd = libc::pollfd { fd: file.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        let ready = unsafe { libc::poll(&mut pfd, 1, 200) };
-        if ready < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted && STOP.load(Ordering::Relaxed) {
-                return Ok(None);
+    let mut flip = None;
+    while flip.is_none() {
+        let poll = read_flip_events(file, |data, _, ns| {
+            if data == cookie {
+                flip = Some(ns);
             }
-            return Err(e.into());
-        }
-        if ready == 0 {
-            return Err(format!("flip event for commit {cookie} timed out (200 ms)").into());
-        }
-        let n = file.read(&mut buf)?;
-        let mut offset = 0;
-        while offset + size_of::<drm_event>() <= n {
-            let header: drm_event = unsafe { std::ptr::read_unaligned(buf[offset..].as_ptr().cast()) };
-            if header.type_ == FLIP_COMPLETE && offset + size_of::<drm_event_vblank>() <= n {
-                let e: drm_event_vblank = unsafe { std::ptr::read_unaligned(buf[offset..].as_ptr().cast()) };
-                if e.user_data == cookie {
-                    return Ok(Some(e.tv_sec as u64 * 1_000_000_000 + e.tv_usec as u64 * 1000));
-                }
-            }
-            offset += header.length.max(8) as usize;
+        })?;
+        match poll {
+            EventPoll::Stopped => return Ok(None),
+            EventPoll::TimedOut => return Err(format!("flip event for commit {cookie} timed out (200 ms)").into()),
+            EventPoll::Read => {}
         }
     }
+    Ok(flip)
+}
+
+/// A commit touching two CRTCs completes with one flip event per CRTC, all carrying the
+/// same `cookie`. Blocks until the event of every expected CRTC arrives and returns the
+/// per-CRTC CLOCK_MONOTONIC ns `[A, B]` (`None` for a CRTC not expected); `None` if stopped.
+fn wait_flips_dual(
+    file: &mut File,
+    cookie: u64,
+    crtc_a: u32,
+    crtc_b: u32,
+    expect_a: bool,
+    expect_b: bool,
+) -> Result<Option<[Option<u64>; 2]>> {
+    let mut flips = [None, None];
+    let missing = |flips: &[Option<u64>; 2]| [expect_a && flips[0].is_none(), expect_b && flips[1].is_none()];
+    while missing(&flips).contains(&true) {
+        let poll = read_flip_events(file, |data, crtc, ns| {
+            if data == cookie {
+                if crtc == crtc_a {
+                    flips[0] = Some(ns);
+                } else if crtc == crtc_b {
+                    flips[1] = Some(ns);
+                }
+            }
+        })?;
+        match poll {
+            EventPoll::Stopped => return Ok(None),
+            EventPoll::TimedOut => {
+                let crtcs: Vec<String> = missing(&flips)
+                    .into_iter()
+                    .zip([crtc_a, crtc_b])
+                    .filter(|&(m, _)| m)
+                    .map(|(_, crtc)| crtc.to_string())
+                    .collect();
+                return Err(format!(
+                    "flip event for commit {cookie} on CRTC {} timed out (200 ms)",
+                    crtcs.join(", ")
+                )
+                .into());
+            }
+            EventPoll::Read => {}
+        }
+    }
+    Ok(Some(flips))
 }
 
 struct Options {
     suite: bool,
+    regression: bool,
+    dual_head: bool,
     list: bool,
     device: Option<String>,
     connector: Option<String>,
+    connector_b: Option<String>,
     vrr: Option<u64>,
     pace_hz: Option<f64>,
     overlay_every: u64,
@@ -496,9 +576,12 @@ struct Options {
 fn parse_args() -> Result<Options> {
     let mut o = Options {
         suite: false,
+        regression: false,
+        dual_head: false,
         list: false,
         device: None,
         connector: None,
+        connector_b: None,
         vrr: Some(1),
         pace_hz: None,
         overlay_every: 8,
@@ -519,9 +602,12 @@ fn parse_args() -> Result<Options> {
         let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value"));
         match arg.as_str() {
             "--suite" => o.suite = true,
+            "--regression" => o.regression = true,
+            "--dual-head" => o.dual_head = true,
             "--list" => o.list = true,
             "--device" => o.device = Some(value()?),
             "--connector" => o.connector = Some(value()?),
+            "--connector-b" => o.connector_b = Some(value()?),
             "--vrr" => {
                 o.vrr = match value()?.as_str() {
                     "on" => Some(1),
@@ -766,7 +852,7 @@ fn list_displays(device: Option<&str>) -> Result<()> {
                 for (disp, vrr_cap) in found {
                     let fd = disp.file.as_raw_fd();
                     let m = disp.crtc.mode;
-                    let period_ns = (m.htotal as u64 * m.vtotal as u64 * 1_000_000) / m.clock.max(1) as u64;
+                    let period_ns = frame_period_ns(&m);
                     let hz = 1e9 / period_ns as f64;
                     let conn_props = properties(fd, disp.connector_id, OBJ_CONNECTOR).unwrap_or_default();
                     let (edid_name, edid_vrr) = parse_edid(fd, &conn_props);
@@ -957,6 +1043,24 @@ fn compute_stats(frames: &[Frame], pace_ns: u64, period_ns: u64, skip_warmup_ns:
     [build(0), build(1)]
 }
 
+/// Markdown cells `dt p50 (×T_min) | commit→flip p50 / p95 | delayed / n (%)`.
+fn stats_cells(g: &GroupStats, period_ns: u64) -> String {
+    if g.n == 0 {
+        return "no samples | — | —".into();
+    }
+    let dt_ms = g.dt_p50_us as f64 / 1000.0;
+    format!(
+        "{:.2} ms ({:.2}×) | {:.2} / {:.2} ms | {} / {} ({:.1}%)",
+        dt_ms,
+        dt_ms / (period_ns as f64 / 1e6),
+        g.c2f_p50_us as f64 / 1000.0,
+        g.c2f_p95_us as f64 / 1000.0,
+        g.delayed,
+        g.n,
+        100.0 * g.delayed as f64 / g.n as f64,
+    )
+}
+
 fn disable_plane(plane: &Plane) -> Result<Vec<(u32, u64)>> {
     Ok(vec![(plane.prop("FB_ID")?, 0), (plane.prop("CRTC_ID")?, 0)])
 }
@@ -981,23 +1085,31 @@ fn configure_secondary_state(
     Ok(state)
 }
 
-fn run_suite(o: Options) -> Result<()> {
-    let mut disp = open_active_display(o.device.as_deref(), o.connector.as_deref())?;
-    let fd = disp.file.as_raw_fd();
-    let m = disp.crtc.mode;
-    let period_ns = (m.htotal as u64 * m.vtotal as u64 * 1_000_000) / m.clock.max(1) as u64;
-    let refresh_hz = 1e9 / period_ns as f64;
-    let pace_hz = o.pace_hz.unwrap_or(refresh_hz * 0.83);
-    let pace_ns = (1e9 / pace_hz) as u64;
-    let case_secs = o.seconds.unwrap_or(7.0);
-    let (width, height) = (m.hdisplay as u32, m.vdisplay as u32);
-    let conn_props = properties(fd, disp.connector_id, OBJ_CONNECTOR)?;
-    let vrr_capable = find(&conn_props, "vrr_capable").map(|p| p.1);
-    let (edid_name, edid_vrr) = parse_edid(fd, &conn_props);
-    let crtc_props = properties(fd, disp.crtc.crtc_id, OBJ_CRTC)?;
-    let vrr_prop = find(&crtc_props, "VRR_ENABLED");
-    let (gpu_desc, kernel) = system_metadata(&disp.device_path);
+fn frame_period_ns(m: &drm_mode_modeinfo) -> u64 {
+    (m.htotal as u64 * m.vtotal as u64 * 1_000_000) / m.clock.max(1) as u64
+}
 
+/// Planes usable on one CRTC: the first XRGB8888 primary and first ARGB8888 overlay and
+/// cursor that are free or already on it (skipping `exclude`), plus every plane on it.
+struct CrtcPlanes {
+    primary: Plane,
+    overlay: Option<Plane>,
+    cursor: Option<Plane>,
+    active: Vec<u32>,
+}
+
+impl CrtcPlanes {
+    /// Planes currently on the CRTC other than the primary and `used`.
+    fn others(&self, used: &[u32]) -> Vec<u32> {
+        self.active.iter().copied().filter(|id| *id != self.primary.id && !used.contains(id)).collect()
+    }
+
+    fn ids(&self) -> Vec<u32> {
+        [Some(&self.primary), self.overlay.as_ref(), self.cursor.as_ref()].into_iter().flatten().map(|p| p.id).collect()
+    }
+}
+
+fn crtc_planes(fd: RawFd, crtc_id: u32, crtc_index: usize, exclude: &[u32]) -> Result<CrtcPlanes> {
     let mut planes = drm_mode_get_plane_res::default();
     ioctl(fd, 0xb5, &mut planes)?;
     let mut ids = vec![0u32; planes.count_planes as usize];
@@ -1010,11 +1122,11 @@ fn run_suite(o: Options) -> Result<()> {
         let mut formats = vec![0u32; p.count_format_types as usize];
         p.format_type_ptr = formats.as_mut_ptr() as u64;
         ioctl(fd, 0xb6, &mut p)?;
-        if p.possible_crtcs & (1 << disp.crtc_index) == 0 || (p.crtc_id != 0 && p.crtc_id != disp.crtc.crtc_id) {
+        if exclude.contains(&id) || p.possible_crtcs & (1 << crtc_index) == 0 || (p.crtc_id != 0 && p.crtc_id != crtc_id) {
             continue;
         }
         let props = properties(fd, id, OBJ_PLANE)?;
-        if p.crtc_id == disp.crtc.crtc_id {
+        if p.crtc_id == crtc_id {
             active.push(id);
         }
         match find(&props, "type").map(|t| t.1) {
@@ -1025,15 +1137,22 @@ fn run_suite(o: Options) -> Result<()> {
         }
     }
     let primary = primary.ok_or("no primary plane with XRGB8888")?;
-    let others: Vec<u32> = active
-        .into_iter()
-        .filter(|&id| {
-            id != primary.id
-                && overlay.as_ref().is_none_or(|p| p.id != id)
-                && cursor.as_ref().is_none_or(|p| p.id != id)
-        })
-        .collect();
+    Ok(CrtcPlanes { primary, overlay, cursor, active })
+}
 
+/// Turns off every plane in `ids` that has FB_ID and CRTC_ID properties.
+fn disable_planes(fd: RawFd, ids: &[u32], commit: &mut Atomic) -> Result<()> {
+    for &id in ids {
+        let props = properties(fd, id, OBJ_PLANE)?;
+        if let (Some((fb, _)), Some((crtc_prop, _))) = (find(&props, "FB_ID"), find(&props, "CRTC_ID")) {
+            commit.object(id, &[(fb, 0), (crtc_prop, 0)]);
+        }
+    }
+    Ok(())
+}
+
+/// Becomes DRM master and makes SIGINT/SIGTERM stop the run gracefully.
+fn take_master(fd: RawFd) -> Result<()> {
     let request = (100u64 << 8) | 0x1e; // SET_MASTER
     if unsafe { libc::ioctl(fd, request as _) } < 0 {
         return Err(format!(
@@ -1051,6 +1170,62 @@ fn run_suite(o: Options) -> Result<()> {
     for signal in [libc::SIGINT, libc::SIGTERM] {
         unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) };
     }
+    Ok(())
+}
+
+/// Two overlay buffers (orange, cyan): an opaque 320x120 card on transparent margins.
+fn overlay_buffers(fd: RawFd, w: u32, h: u32) -> Result<[Buffer; 2]> {
+    let mut b = [Buffer::new(fd, w, h, ARGB8888, 0xffe0_6020)?, Buffer::new(fd, w, h, ARGB8888, 0xff20_c0e0)?];
+    for buf in &mut b {
+        let (cw, ch) = (buf.width.min(320), buf.height.min(120));
+        buf.fill(cw, 0, buf.width - cw, ch, 0);
+        buf.fill(0, ch, buf.width, buf.height - ch, 0);
+    }
+    Ok(b)
+}
+
+/// A transparent cursor buffer with an opaque 32x32 `color` square in the top-left corner.
+fn cursor_buffer(fd: RawFd, w: u32, h: u32, color: u32) -> Result<Buffer> {
+    let mut b = Buffer::new(fd, w, h, ARGB8888, 0)?;
+    b.fill(0, 0, w.min(32), h.min(32), color);
+    Ok(b)
+}
+
+fn edid_desc((name, vrr): &(Option<String>, Option<(u32, u32)>)) -> String {
+    match (name, vrr) {
+        (Some(n), Some((lo, hi))) => format!(" — `{n}` (EDID `{lo}–{hi} Hz`)"),
+        (Some(n), None) => format!(" — `{n}`"),
+        (None, Some((lo, hi))) => format!(" (EDID `{lo}–{hi} Hz`)"),
+        (None, None) => String::new(),
+    }
+}
+
+fn opt_str(v: Option<u64>) -> String {
+    v.map(|v| v.to_string()).unwrap_or_else(|| "none".into())
+}
+
+fn run_suite(o: Options) -> Result<()> {
+    let mut disp = open_active_display(o.device.as_deref(), o.connector.as_deref())?;
+    let fd = disp.file.as_raw_fd();
+    let m = disp.crtc.mode;
+    let period_ns = frame_period_ns(&m);
+    let refresh_hz = 1e9 / period_ns as f64;
+    let pace_hz = o.pace_hz.unwrap_or(refresh_hz * 0.83);
+    let pace_ns = (1e9 / pace_hz) as u64;
+    let case_secs = o.seconds.unwrap_or(7.0);
+    let (width, height) = (m.hdisplay as u32, m.vdisplay as u32);
+    let conn_props = properties(fd, disp.connector_id, OBJ_CONNECTOR)?;
+    let vrr_capable = find(&conn_props, "vrr_capable").map(|p| p.1);
+    let edid = parse_edid(fd, &conn_props);
+    let crtc_props = properties(fd, disp.crtc.crtc_id, OBJ_CRTC)?;
+    let vrr_prop = find(&crtc_props, "VRR_ENABLED");
+    let (gpu_desc, kernel) = system_metadata(&disp.device_path);
+
+    let planes = crtc_planes(fd, disp.crtc.crtc_id, disp.crtc_index, &[])?;
+    let others = planes.others(&planes.ids());
+    let CrtcPlanes { primary, overlay, cursor, .. } = planes;
+
+    take_master(fd)?;
 
     let mut game = [
         Buffer::new(fd, width, height, XRGB8888, GRAPH_BACKGROUND)?,
@@ -1058,62 +1233,91 @@ fn run_suite(o: Options) -> Result<()> {
     ];
     let (ow, oh) = (o.overlay_size.0.min(width), o.overlay_size.1.min(height));
     let (ox, oy) = (o.overlay_pos.0.min(width.saturating_sub(ow + 16)), o.overlay_pos.1.min(height.saturating_sub(oh)));
-    let overlay_bufs = if overlay.is_some() {
-        let mut b = [
-            Buffer::new(fd, ow, oh, ARGB8888, 0xffe0_6020)?,
-            Buffer::new(fd, ow, oh, ARGB8888, 0xff20_c0e0)?,
-        ];
-        for buf in &mut b {
-            let (cw, ch) = (buf.width.min(320), buf.height.min(120));
-            buf.fill(cw, 0, buf.width - cw, ch, 0);
-            buf.fill(0, ch, buf.width, buf.height - ch, 0);
-        }
-        Some(b)
-    } else {
-        None
-    };
+    let overlay_bufs = overlay.as_ref().map(|_| overlay_buffers(fd, ow, oh)).transpose()?;
     let (cw, ch) = cursor_size(fd);
     let (cx, cy) = (0u32, 0u32);
-    let cursor_buf = if cursor.is_some() {
-        let mut b = Buffer::new(fd, cw, ch, ARGB8888, 0)?;
-        b.fill(0, 0, cw.min(32), ch.min(32), 0xffff_ffff);
-        Some(b)
-    } else {
-        None
-    };
+    let cursor_bufs = cursor
+        .as_ref()
+        .map(|_| -> Result<[Buffer; 2]> { Ok([cursor_buffer(fd, cw, ch, WHITE)?, cursor_buffer(fd, cw, ch, CYAN)?]) })
+        .transpose()?;
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Update {
+        OverlaySwap,
+        OverlayMove,
+        CursorMove,
+        CursorSwap,
+    }
     struct CaseSpec {
         label: &'static str,
         update_label: &'static str,
         kind: PatternKind,
         top_half_only: bool,
-        use_cursor: bool,
+        update: Update,
+        /// Update frames commit only the secondary plane.
         exclusive: bool,
+        /// Every frame is an update frame, so the primary never flips after setup.
+        idle_primary: bool,
+        /// Run with VRR_ENABLED=0 (fixed refresh) instead of the --vrr setting.
+        vrr_off: bool,
     }
-    let cases = [
-        CaseSpec { label: "`solid` (control)", update_label: "overlay swap", kind: PatternKind::Solid, top_half_only: false, use_cursor: false, exclusive: false },
-        CaseSpec { label: "`hstripes` (control)", update_label: "overlay swap", kind: PatternKind::HStripes, top_half_only: false, use_cursor: false, exclusive: false },
-        CaseSpec { label: "`vstripes` (full)", update_label: "overlay swap", kind: PatternKind::VStripes, top_half_only: false, use_cursor: false, exclusive: false },
-        CaseSpec { label: "`vstripes` (top half)", update_label: "overlay swap", kind: PatternKind::VStripes, top_half_only: true, use_cursor: false, exclusive: false },
-        CaseSpec { label: "`vstripes` (cursor)", update_label: "cursor move", kind: PatternKind::VStripes, top_half_only: false, use_cursor: true, exclusive: false },
-        CaseSpec { label: "`vstripes` (`--exclusive`)", update_label: "overlay only (1 plane)", kind: PatternKind::VStripes, top_half_only: false, use_cursor: false, exclusive: true },
+    let spec = |label, update_label, kind, top_half_only, update, exclusive| CaseSpec {
+        label,
+        update_label,
+        kind,
+        top_half_only,
+        update,
+        exclusive,
+        idle_primary: false,
+        vrr_off: false,
+    };
+    let mut cases = vec![
+        spec("`solid` (control)", "overlay swap", PatternKind::Solid, false, Update::OverlaySwap, false),
+        spec("`hstripes` (control)", "overlay swap", PatternKind::HStripes, false, Update::OverlaySwap, false),
+        spec("`vstripes` (full)", "overlay swap", PatternKind::VStripes, false, Update::OverlaySwap, false),
+        spec("`vstripes` (top half)", "overlay swap", PatternKind::VStripes, true, Update::OverlaySwap, false),
+        spec("`vstripes` (cursor)", "cursor move", PatternKind::VStripes, false, Update::CursorMove, false),
+        spec("`vstripes` (`--exclusive`)", "overlay only (1 plane)", PatternKind::VStripes, false, Update::OverlaySwap, true),
     ];
+    if o.regression {
+        cases.extend([
+            spec("`vstripes` (overlay move)", "overlay move", PatternKind::VStripes, false, Update::OverlayMove, false),
+            spec("`vstripes` (overlay move `--exclusive`)", "overlay move only (1 plane)", PatternKind::VStripes, false, Update::OverlayMove, true),
+            spec("`vstripes` (cursor swap)", "cursor swap", PatternKind::VStripes, false, Update::CursorSwap, false),
+            CaseSpec {
+                idle_primary: true,
+                ..spec("`vstripes` (cursor-only idle)", "cursor move only, every frame", PatternKind::VStripes, false, Update::CursorMove, true)
+            },
+            CaseSpec {
+                vrr_off: true,
+                ..spec("`vstripes` (VRR off control, `VRR=0`)", "overlay swap (fixed refresh)", PatternKind::VStripes, false, Update::OverlaySwap, false)
+            },
+        ]);
+    }
 
     let mut next_cookie = 1u64;
     let primary_fb = primary.prop("FB_ID")?;
     let mut rows: Vec<String> = Vec::new();
     let mut vrr_set_ok = true;
+    // VRR_ENABLED currently applied to the CRTC.
+    let mut applied_vrr = vrr_prop.map(|p| p.1);
 
     for (ci, case) in cases.iter().enumerate() {
         if STOP.load(Ordering::Relaxed) {
             break;
         }
-        let sec_plane = if case.use_cursor { cursor.as_ref() } else { overlay.as_ref() };
+        let use_cursor = matches!(case.update, Update::CursorMove | Update::CursorSwap);
+        let sec_plane = if use_cursor { cursor.as_ref() } else { overlay.as_ref() };
         let Some(sec) = sec_plane else {
-            let reason = if case.use_cursor { "no cursor plane" } else { "no overlay plane" };
+            let reason = if use_cursor { "no cursor plane" } else { "no overlay plane" };
             rows.push(format!("| {} | {} | skipped ({reason}) | — | — | — |", case.label, case.update_label));
             continue;
         };
+        if case.vrr_off && vrr_prop.is_none() {
+            rows.push(format!("| {} | {} | skipped (no `VRR_ENABLED` property) | — | — | — |", case.label, case.update_label));
+            continue;
+        }
+        let case_vrr = if case.vrr_off { Some(0) } else { o.vrr.or(vrr_prop.map(|p| p.1)) };
 
         let pat = Pattern { kind: case.kind, period: 4, on: 3, fg: GREEN, bg: GRAPH_BACKGROUND, rect: None };
         let rect = if case.top_half_only { (0, 0, width, height / 2) } else { (0, 0, width, height) };
@@ -1124,11 +1328,11 @@ fn run_suite(o: Options) -> Result<()> {
 
         let mut setup = Atomic::default();
         setup.object(primary.id, &plane_geometry(&primary, disp.crtc.crtc_id, game[0].fb, width, height, 0, 0)?);
-        if case.use_cursor {
+        if use_cursor {
             if let Some(ovl) = &overlay {
                 setup.object(ovl.id, &disable_plane(ovl)?);
             }
-            let cb = cursor_buf.as_ref().unwrap();
+            let cb = &cursor_bufs.as_ref().unwrap()[0];
             setup.object(sec.id, &configure_secondary_state(&primary, sec, disp.crtc.crtc_id, cb.fb, (cx, cy, cw, ch))?);
         } else {
             if let Some(cur) = &cursor {
@@ -1137,21 +1341,15 @@ fn run_suite(o: Options) -> Result<()> {
             let ob = overlay_bufs.as_ref().unwrap();
             setup.object(sec.id, &configure_secondary_state(&primary, sec, disp.crtc.crtc_id, ob[0].fb, (ox, oy, ow, oh))?);
         }
-        if ci == 0 {
-            if !o.keep_planes {
-                for &id in &others {
-                    let props = properties(fd, id, OBJ_PLANE)?;
-                    let (Some((fb, _)), Some((crtc_prop, _))) = (find(&props, "FB_ID"), find(&props, "CRTC_ID")) else {
-                        continue;
-                    };
-                    setup.object(id, &[(fb, 0), (crtc_prop, 0)]);
-                }
-            }
-            if let (Some(value), Some((id, _))) = (o.vrr, vrr_prop) {
+        if ci == 0 && !o.keep_planes {
+            disable_planes(fd, &others, &mut setup)?;
+        }
+        if let (Some(value), Some((id, _))) = (case_vrr, vrr_prop) {
+            if (ci == 0 && o.vrr.is_some()) || applied_vrr != Some(value) {
                 setup.object(disp.crtc.crtc_id, &[(id, value)]);
-            } else if o.vrr.is_some() {
-                vrr_set_ok = false;
             }
+        } else if ci == 0 && o.vrr.is_some() {
+            vrr_set_ok = false;
         }
         if let Err(e) = setup.commit(fd, TEST_ONLY, 0) {
             rows.push(format!("| {} | {} | skipped (TEST_ONLY: {e}) | — | — | — |", case.label, case.update_label));
@@ -1160,12 +1358,16 @@ fn run_suite(o: Options) -> Result<()> {
         let c0 = next_cookie;
         next_cookie += 1;
         setup.commit(fd, NONBLOCK | FLIP_EVENT, c0)?;
+        if vrr_prop.is_some() && case_vrr.is_some() {
+            applied_vrr = case_vrr;
+        }
         let Some(initial_flip) = wait_flip(&mut disp.file, c0)? else {
             break;
         };
 
         let sec_fb = sec.prop("FB_ID")?;
         let sec_x = sec.prop("CRTC_X")?;
+        let every = if case.idle_primary { 1 } else { o.overlay_every };
         let mut frames: Vec<Frame> = Vec::with_capacity((case_secs * pace_hz * 1.1) as usize);
         let start = now_ns();
         let duration = (case_secs * 1e9) as u64;
@@ -1175,19 +1377,21 @@ fn run_suite(o: Options) -> Result<()> {
 
         while now_ns() - start < duration && !STOP.load(Ordering::Relaxed) {
             let buffer = &game[(frame % 2) as usize];
-            let overlay_flipped = frame.is_multiple_of(o.overlay_every);
+            let overlay_flipped = frame.is_multiple_of(every);
             let mut commit = Atomic::default();
             if !(case.exclusive && overlay_flipped) {
                 commit.object(primary.id, &[(primary_fb, buffer.fb as u64)]);
             }
             if overlay_flipped {
-                let n = frame / o.overlay_every;
-                if case.use_cursor {
-                    commit.object(sec.id, &[(sec_x, cx as u64 + 16 * (n % 2))]);
-                } else {
-                    let ob = overlay_bufs.as_ref().unwrap();
-                    commit.object(sec.id, &[(sec_fb, ob[(n % 2) as usize].fb as u64)]);
-                }
+                let n = frame / every;
+                let i = (n % 2) as usize;
+                let update = match case.update {
+                    Update::OverlaySwap => (sec_fb, overlay_bufs.as_ref().unwrap()[i].fb as u64),
+                    Update::CursorSwap => (sec_fb, cursor_bufs.as_ref().unwrap()[i].fb as u64),
+                    Update::OverlayMove => (sec_x, ox as u64 + 16 * i as u64),
+                    Update::CursorMove => (sec_x, cx as u64 + 16 * i as u64),
+                };
+                commit.object(sec.id, &[update]);
             }
             sleep_until(next_due);
             let cookie = next_cookie;
@@ -1223,23 +1427,8 @@ fn run_suite(o: Options) -> Result<()> {
         }
         let warmup = if case_secs >= 3.0 { 1_000_000_000 } else { 0 };
         let [pri, ovl] = compute_stats(&frames, pace_ns, period_ns, warmup);
-        let tmin_ms = period_ns as f64 / 1e6;
-        let dt_ms = ovl.dt_p50_us as f64 / 1000.0;
-        let ratio = dt_ms / tmin_ms;
-        let pct_del = if ovl.n > 0 { 100.0 * ovl.delayed as f64 / ovl.n as f64 } else { 0.0 };
-        rows.push(format!(
-            "| {} | {} | {:.2} ms ({:.2}×) | {:.2} / {:.2} ms | {} / {} ({:.1}%) | {:.2} ms |",
-            case.label,
-            case.update_label,
-            dt_ms,
-            ratio,
-            ovl.c2f_p50_us as f64 / 1000.0,
-            ovl.c2f_p95_us as f64 / 1000.0,
-            ovl.delayed,
-            ovl.n,
-            pct_del,
-            pri.c2f_p50_us as f64 / 1000.0,
-        ));
+        let primary_only = if pri.n == 0 { "—".to_string() } else { format!("{:.2} ms", pri.c2f_p50_us as f64 / 1000.0) };
+        rows.push(format!("| {} | {} | {} | {primary_only} |", case.label, case.update_label, stats_cells(&ovl, period_ns)));
     }
 
     // Restore: secondary planes off, VRR as found.
@@ -1250,30 +1439,26 @@ fn run_suite(o: Options) -> Result<()> {
     if let Some(cur) = &cursor {
         cleanup.object(cur.id, &disable_plane(cur)?);
     }
-    if let (Some(_), Some((id, value))) = (o.vrr, vrr_prop) {
-        cleanup.object(disp.crtc.crtc_id, &[(id, value)]);
+    if let Some((id, value)) = vrr_prop {
+        if o.vrr.is_some() || applied_vrr != Some(value) {
+            cleanup.object(disp.crtc.crtc_id, &[(id, value)]);
+        }
     }
     let cookie = u64::MAX;
     if cleanup.commit(fd, NONBLOCK | FLIP_EVENT, cookie).is_ok() {
         let _ = wait_flip(&mut disp.file, cookie);
     }
 
-    let edid_desc = match (edid_name, edid_vrr) {
-        (Some(n), Some((lo, hi))) => format!(" — `{n}` (EDID `{lo}–{hi} Hz`)"),
-        (Some(n), None) => format!(" — `{n}`"),
-        (None, Some((lo, hi))) => format!(" (EDID `{lo}–{hi} Hz`)"),
-        (None, None) => String::new(),
-    };
     println!("### System");
     println!("- **GPU:** {gpu_desc}");
     println!("- **Kernel:** `{kernel}`");
-    println!("- **Connector:** `{}` (`{}`){edid_desc}", disp.connector_name, disp.device_path);
+    println!("- **Connector:** `{}` (`{}`){}", disp.connector_name, disp.device_path, edid_desc(&edid));
     println!(
         "- **Mode:** `{width}x{height} @ {refresh_hz:.3} Hz` (`T_min = {:.2} ms`, `vrr_capable={}`, `VRR_ENABLED: {} -> {}`)",
         period_ns as f64 / 1e6,
-        vrr_capable.map(|v| v.to_string()).unwrap_or_else(|| "none".into()),
-        vrr_prop.map(|p| p.1.to_string()).unwrap_or_else(|| "none".into()),
-        o.vrr.or(vrr_prop.map(|p| p.1)).map(|v| v.to_string()).unwrap_or_else(|| "none".into()),
+        opt_str(vrr_capable),
+        opt_str(vrr_prop.map(|p| p.1)),
+        opt_str(o.vrr.or(vrr_prop.map(|p| p.1))),
     );
     println!(
         "- **Suite pace:** `{pace_hz:.2} Hz` (`{:.2} ms`, {:.0}% of refresh), plane update every {} frames, {:.0} s/case",
@@ -1291,6 +1476,413 @@ fn run_suite(o: Options) -> Result<()> {
     for r in &rows {
         println!("{r}");
     }
+    if o.regression {
+        println!();
+        println!("- `cursor-only idle`: after setup every commit moves only the cursor (the primary never flips), so there are no primary-only samples (`—`); a flip-event timeout shows as `error (...)`.");
+        println!("- `VRR=0` row: fixed refresh at the same pace; `Delayed` there counts ordinary waits for the next fixed vblank, not VRR stalls. `VRR_ENABLED` is restored afterwards.");
+    }
+    Ok(())
+}
+
+/// Two connected connectors driven by distinct active CRTCs of one DRM device: head A is
+/// `connector_a` (default: the first, preferring vrr_capable=1), head B is `connector_b`
+/// (default: the next active CRTC on the same device).
+fn open_dual_displays(
+    device: Option<&str>,
+    connector_a: Option<&str>,
+    connector_b: Option<&str>,
+) -> Result<[ActiveDisplay; 2]> {
+    let cards = match device {
+        Some(path) => vec![path.to_string()],
+        None => candidate_cards(),
+    };
+    let mut notes = Vec::new();
+    for path in &cards {
+        let found = match probe_card_all(path, None) {
+            Ok(found) => found,
+            Err(e) if device.is_some() => return Err(e),
+            Err(e) => {
+                notes.push(format!("{path}: {e}"));
+                continue;
+            }
+        };
+        let named = |d: &ActiveDisplay, name: Option<&str>| name.is_none_or(|n| d.connector_name == n);
+        let a = found
+            .iter()
+            .position(|(d, vrr)| named(d, connector_a) && *vrr == Some(1))
+            .or_else(|| found.iter().position(|(d, _)| named(d, connector_a)));
+        let b = a.and_then(|a| {
+            let crtc_a = found[a].0.crtc.crtc_id;
+            found.iter().position(|(d, _)| named(d, connector_b) && d.crtc.crtc_id != crtc_a)
+        });
+        if let (Some(a), Some(b)) = (a, b) {
+            // a != b (distinct CRTCs); remove the higher index first so the lower stays valid.
+            let mut found = found;
+            let high = found.swap_remove(a.max(b)).0;
+            let low = found.swap_remove(a.min(b)).0;
+            return Ok(if a < b { [low, high] } else { [high, low] });
+        }
+        let names: Vec<String> = found.iter().map(|(d, _)| format!("{} (CRTC {})", d.connector_name, d.crtc.crtc_id)).collect();
+        notes.push(format!("{path}: {} active [{}]", found.len(), names.join(", ")));
+    }
+    let wanted = format!("A={}, B={}", connector_a.unwrap_or("auto"), connector_b.unwrap_or("auto"));
+    let found = if notes.is_empty() { "no /dev/dri/card* devices".to_string() } else { notes.join("; ") };
+    Err(format!(
+        "--dual-head needs two connected connectors on distinct active CRTCs of one DRM device ({wanted}); found: {found}. \
+         Enable a second display in the compositor first, or pick heads with --device / --connector / --connector-b"
+    )
+    .into())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// Primary flip every frame plus an overlay buffer swap every K frames.
+    Flip,
+    /// Static primary; a cursor CRTC_X move every K frames is the head's only update.
+    Cursor,
+}
+
+impl Role {
+    fn label(self, vrr: u64) -> String {
+        match self {
+            Role::Flip => format!("`VRR={vrr}` primary flip + overlay swap"),
+            Role::Cursor => format!("`VRR={vrr}` static primary, cursor move"),
+        }
+    }
+}
+
+/// One head's per-frame commit content: an optional property set every frame (primary
+/// flip) and one set every K frames (secondary plane update), each alternating two values.
+struct HeadPlan {
+    every_frame: Option<(u32, u32, [u64; 2])>,
+    on_update: (u32, u32, [u64; 2]),
+}
+
+impl HeadPlan {
+    /// Adds this head's state for `frame` to `commit`; returns whether the head is part of it.
+    fn add(&self, commit: &mut Atomic, frame: u64, every: u64) -> bool {
+        if let Some((plane, prop, values)) = self.every_frame {
+            commit.object(plane, &[(prop, values[(frame % 2) as usize])]);
+        }
+        let update = frame.is_multiple_of(every);
+        if update {
+            let (plane, prop, values) = self.on_update;
+            commit.object(plane, &[(prop, values[(frame / every % 2) as usize])]);
+        }
+        update || self.every_frame.is_some()
+    }
+}
+
+/// A head of the dual-head run with its planes, full-screen `vstripes` primary buffers and
+/// secondary plane buffers.
+struct Head {
+    disp: ActiveDisplay,
+    period_ns: u64,
+    size: (u32, u32),
+    vrr_capable: Option<u64>,
+    /// VRR_ENABLED (property id, value at start); restored at exit.
+    vrr_prop: Option<(u32, u64)>,
+    edid: (Option<String>, Option<(u32, u32)>),
+    primary: Plane,
+    game: [Buffer; 2],
+    overlay: Option<(Plane, [Buffer; 2])>,
+    overlay_rect: (u32, u32, u32, u32),
+    cursor: Option<(Plane, Buffer)>,
+    cursor_size: (u32, u32),
+    others: Vec<u32>,
+}
+
+impl Head {
+    fn new(fd: RawFd, disp: ActiveDisplay, exclude: &[u32], o: &Options) -> Result<Self> {
+        let m = disp.crtc.mode;
+        let (w, h) = (m.hdisplay as u32, m.vdisplay as u32);
+        let conn_props = properties(fd, disp.connector_id, OBJ_CONNECTOR)?;
+        let vrr_prop = find(&properties(fd, disp.crtc.crtc_id, OBJ_CRTC)?, "VRR_ENABLED");
+        let planes = crtc_planes(fd, disp.crtc.crtc_id, disp.crtc_index, exclude)
+            .map_err(|e| format!("{} (CRTC {}): {e}", disp.connector_name, disp.crtc.crtc_id))?;
+        let others = planes.others(&planes.ids());
+        let mut game = [
+            Buffer::new(fd, w, h, XRGB8888, GRAPH_BACKGROUND)?,
+            Buffer::new(fd, w, h, XRGB8888, GRAPH_BACKGROUND)?,
+        ];
+        let pat = Pattern { kind: PatternKind::VStripes, period: 4, on: 3, fg: GREEN, bg: GRAPH_BACKGROUND, rect: None };
+        for buf in &mut game {
+            buf.draw_pattern(&pat, (0, 0, w, h));
+        }
+        let (ow, oh) = (o.overlay_size.0.min(w), o.overlay_size.1.min(h));
+        let overlay_rect = (o.overlay_pos.0.min(w.saturating_sub(ow + 16)), o.overlay_pos.1.min(h.saturating_sub(oh)), ow, oh);
+        let cursor_size = cursor_size(fd);
+        let overlay = planes.overlay.map(|p| -> Result<_> { Ok((p, overlay_buffers(fd, ow, oh)?)) }).transpose()?;
+        let cursor = planes
+            .cursor
+            .map(|p| -> Result<_> { Ok((p, cursor_buffer(fd, cursor_size.0, cursor_size.1, WHITE)?)) })
+            .transpose()?;
+        Ok(Self {
+            period_ns: frame_period_ns(&m),
+            size: (w, h),
+            vrr_capable: find(&conn_props, "vrr_capable").map(|p| p.1),
+            vrr_prop,
+            edid: parse_edid(fd, &conn_props),
+            primary: planes.primary,
+            game,
+            overlay,
+            overlay_rect,
+            cursor,
+            cursor_size,
+            others,
+            disp,
+        })
+    }
+
+    fn crtc_id(&self) -> u32 {
+        self.disp.crtc.crtc_id
+    }
+
+    fn plane_ids(&self) -> Vec<u32> {
+        let overlay = self.overlay.as_ref().map(|(p, _)| p.id);
+        let cursor = self.cursor.as_ref().map(|(p, _)| p.id);
+        [Some(self.primary.id), overlay, cursor].into_iter().flatten().collect()
+    }
+
+    /// Adds this head's full plane state for `role` and VRR_ENABLED=`vrr` to `commit`.
+    fn setup(&self, role: Role, vrr: u64, commit: &mut Atomic) -> Result<HeadPlan> {
+        let crtc = self.crtc_id();
+        let (w, h) = self.size;
+        let missing = |what: &str| format!("`{}` has no {what} plane", self.disp.connector_name);
+        commit.object(self.primary.id, &plane_geometry(&self.primary, crtc, self.game[0].fb, w, h, 0, 0)?);
+        let plan = match role {
+            Role::Flip => {
+                let (ovl, bufs) = self.overlay.as_ref().ok_or_else(|| missing("overlay"))?;
+                if let Some((cur, _)) = &self.cursor {
+                    commit.object(cur.id, &disable_plane(cur)?);
+                }
+                commit.object(ovl.id, &configure_secondary_state(&self.primary, ovl, crtc, bufs[0].fb, self.overlay_rect)?);
+                HeadPlan {
+                    every_frame: Some((
+                        self.primary.id,
+                        self.primary.prop("FB_ID")?,
+                        [self.game[0].fb as u64, self.game[1].fb as u64],
+                    )),
+                    on_update: (ovl.id, ovl.prop("FB_ID")?, [bufs[0].fb as u64, bufs[1].fb as u64]),
+                }
+            }
+            Role::Cursor => {
+                let (cur, buf) = self.cursor.as_ref().ok_or_else(|| missing("cursor"))?;
+                if let Some((ovl, _)) = &self.overlay {
+                    commit.object(ovl.id, &disable_plane(ovl)?);
+                }
+                let (cw, ch) = self.cursor_size;
+                commit.object(cur.id, &configure_secondary_state(&self.primary, cur, crtc, buf.fb, (0, 0, cw, ch))?);
+                HeadPlan { every_frame: None, on_update: (cur.id, cur.prop("CRTC_X")?, [0, 16]) }
+            }
+        };
+        if let Some((id, _)) = self.vrr_prop {
+            commit.object(crtc, &[(id, vrr)]);
+        }
+        Ok(plan)
+    }
+
+    /// Adds secondary planes off and VRR_ENABLED as found to `commit`.
+    fn restore(&self, commit: &mut Atomic) -> Result<()> {
+        for plane in [self.overlay.as_ref().map(|(p, _)| p), self.cursor.as_ref().map(|(p, _)| p)].into_iter().flatten() {
+            commit.object(plane.id, &disable_plane(plane)?);
+        }
+        if let Some((id, value)) = self.vrr_prop {
+            commit.object(self.crtc_id(), &[(id, value)]);
+        }
+        Ok(())
+    }
+
+    fn describe(&self) -> String {
+        let m = self.disp.crtc.mode;
+        format!(
+            "`{}` (`{}`, CRTC {}){} — `{}x{} @ {:.3} Hz` (`T_min = {:.2} ms`, `vrr_capable={}`, `VRR_ENABLED` at start: {}, restored at exit)",
+            self.disp.connector_name,
+            self.disp.device_path,
+            self.crtc_id(),
+            edid_desc(&self.edid),
+            m.hdisplay,
+            m.vdisplay,
+            1e9 / self.period_ns as f64,
+            self.period_ns as f64 / 1e6,
+            opt_str(self.vrr_capable),
+            opt_str(self.vrr_prop.map(|p| p.1)),
+        )
+    }
+}
+
+fn run_dual_head(o: Options) -> Result<()> {
+    let [disp_a, disp_b] = open_dual_displays(o.device.as_deref(), o.connector.as_deref(), o.connector_b.as_deref())?;
+    // Both displays share one open file description: one DRM master, one event queue.
+    let mut file = disp_a.file.try_clone()?;
+    let fd = file.as_raw_fd();
+    let (gpu_desc, kernel) = system_metadata(&disp_a.device_path);
+    take_master(fd)?;
+    let head_a = Head::new(fd, disp_a, &[], &o)?;
+    let head_b = Head::new(fd, disp_b, &head_a.plane_ids(), &o)?;
+    let heads = [head_a, head_b];
+    let (crtc_a, crtc_b) = (heads[0].crtc_id(), heads[1].crtc_id());
+
+    let slow_period_ns = heads[0].period_ns.max(heads[1].period_ns);
+    let slow_refresh_hz = 1e9 / slow_period_ns as f64;
+    let pace_hz = o.pace_hz.unwrap_or(slow_refresh_hz * 0.83);
+    let pace_ns = (1e9 / pace_hz) as u64;
+    let case_secs = o.seconds.unwrap_or(7.0);
+    let every = o.overlay_every;
+
+    struct DualCase {
+        label: &'static str,
+        a: Role,
+        b: Role,
+        vrr_b: u64,
+    }
+    let cases = [
+        DualCase { label: "dual: both VRR flips", a: Role::Flip, b: Role::Flip, vrr_b: 1 },
+        DualCase { label: "dual: VRR A flip + VRR B cursor", a: Role::Flip, b: Role::Cursor, vrr_b: 1 },
+        DualCase { label: "dual: VRR A cursor + VRR B flip", a: Role::Cursor, b: Role::Flip, vrr_b: 1 },
+        DualCase { label: "dual: VRR A + fixed B", a: Role::Flip, b: Role::Flip, vrr_b: 0 },
+    ];
+
+    let mut rows: Vec<String> = Vec::new();
+    let mut next_cookie = 1u64;
+    let mut planes_cleared = o.keep_planes;
+    for case in &cases {
+        if STOP.load(Ordering::Relaxed) {
+            break;
+        }
+        let prefix = format!("| {} | {} | {} |", case.label, case.a.label(1), case.b.label(case.vrr_b));
+        let mut setup = Atomic::default();
+        let plans = heads[0]
+            .setup(case.a, 1, &mut setup)
+            .and_then(|a| Ok([a, heads[1].setup(case.b, case.vrr_b, &mut setup)?]));
+        let plans = match plans {
+            Ok(plans) => plans,
+            Err(e) => {
+                rows.push(format!("{prefix} skipped ({e}) | — | — | — | — | — |"));
+                continue;
+            }
+        };
+        if !planes_cleared {
+            for head in &heads {
+                disable_planes(fd, &head.others, &mut setup)?;
+            }
+        }
+        if let Err(e) = setup.commit(fd, TEST_ONLY, 0) {
+            rows.push(format!("{prefix} skipped (TEST_ONLY: {e}) | — | — | — | — | — |"));
+            continue;
+        }
+        let c0 = next_cookie;
+        next_cookie += 1;
+        if let Err(e) = setup.commit(fd, NONBLOCK | FLIP_EVENT, c0) {
+            rows.push(format!("{prefix} error (setup commit: {e}) | — | — | — | — | — |"));
+            continue;
+        }
+        planes_cleared = true;
+        let initial = match wait_flips_dual(&mut file, c0, crtc_a, crtc_b, true, true) {
+            Ok(Some(flips)) => flips.into_iter().flatten().max().unwrap_or_else(now_ns),
+            Ok(None) => break,
+            Err(e) => {
+                rows.push(format!("{prefix} error (setup: {e}) | — | — | — | — | — |"));
+                continue;
+            }
+        };
+
+        let capacity = (case_secs * pace_hz * 1.1) as usize;
+        let mut frames: [Vec<Frame>; 2] = [Vec::with_capacity(capacity), Vec::with_capacity(capacity)];
+        let start = now_ns();
+        let duration = (case_secs * 1e9) as u64;
+        let mut next_due = initial + pace_ns;
+        let mut frame = 1u64;
+        let mut err_msg = None;
+        while now_ns() - start < duration && !STOP.load(Ordering::Relaxed) {
+            let mut commit = Atomic::default();
+            let expect = [plans[0].add(&mut commit, frame, every), plans[1].add(&mut commit, frame, every)];
+            let overlay_flipped = frame.is_multiple_of(every);
+            sleep_until(next_due);
+            let cookie = next_cookie;
+            next_cookie += 1;
+            let commit_ns = now_ns();
+            if let Err(e) = commit.commit(fd, NONBLOCK | FLIP_EVENT, cookie) {
+                err_msg = Some(format!("frame {frame}: commit error: {e}"));
+                break;
+            }
+            match wait_flips_dual(&mut file, cookie, crtc_a, crtc_b, expect[0], expect[1]) {
+                Ok(Some(flips)) => {
+                    let mut latest = 0;
+                    for (head_frames, flip) in frames.iter_mut().zip(flips) {
+                        if let Some(flip_ns) = flip {
+                            head_frames.push(Frame { overlay_flipped, draw_ns: 0, commit_ns, flip_ns });
+                            latest = latest.max(flip_ns);
+                        }
+                    }
+                    // Same rebase as --suite, driven by the later of the two flips.
+                    if latest > next_due + 1_000_000 {
+                        next_due = latest + pace_ns;
+                    } else {
+                        next_due += pace_ns;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    err_msg = Some(format!("frame {frame}: {e}"));
+                    break;
+                }
+            }
+            frame += 1;
+        }
+
+        if let Some(err) = err_msg {
+            rows.push(format!("{prefix} error ({err}) | — | — | — | — | — |"));
+            continue;
+        }
+        let warmup = if case_secs >= 3.0 { 1_000_000_000 } else { 0 };
+        let cells: Vec<String> = heads
+            .iter()
+            .zip(&frames)
+            .map(|(head, frames)| stats_cells(&compute_stats(frames, pace_ns, head.period_ns, warmup)[1], head.period_ns))
+            .collect();
+        rows.push(format!("{prefix} {} | {} |", cells[0], cells[1]));
+    }
+
+    let mut cleanup = Atomic::default();
+    for head in &heads {
+        head.restore(&mut cleanup)?;
+    }
+    let cookie = u64::MAX;
+    if cleanup.commit(fd, NONBLOCK | FLIP_EVENT, cookie).is_ok() {
+        let _ = wait_flips_dual(&mut file, cookie, crtc_a, crtc_b, true, true);
+    }
+
+    println!("### System");
+    println!("- **GPU:** {gpu_desc}");
+    println!("- **Kernel:** `{kernel}`");
+    println!("- **Head A:** {}", heads[0].describe());
+    println!("- **Head B:** {}", heads[1].describe());
+    println!(
+        "- **Dual pace:** `{pace_hz:.2} Hz` (`{:.2} ms`, {:.0}% of the slower head's refresh), plane update every {every} frames, {case_secs:.0} s/case; every frame is one `NONBLOCK | FLIP_EVENT` atomic commit spanning both CRTCs (one flip event per CRTC)",
+        pace_ns as f64 / 1e6,
+        100.0 * pace_hz / slow_refresh_hz,
+    );
+    for head in &heads {
+        if head.vrr_capable == Some(0) || head.vrr_prop.is_none() {
+            println!(
+                "\n> **Warning:** VRR cannot be enabled on `{}` (`vrr_capable={}`, `VRR_ENABLED` available={}). Its `VRR=1` rows reflect fixed-refresh timing.",
+                head.disp.connector_name,
+                opt_str(head.vrr_capable),
+                head.vrr_prop.is_some(),
+            );
+        }
+    }
+    println!();
+    println!("| Case | Head A | Head B | A: `dt` p50 (×T_min) | A: `commit→flip` p50 / p95 | A: Delayed (>1 ms) | B: `dt` p50 (×T_min) | B: `commit→flip` p50 / p95 | B: Delayed (>1 ms) |");
+    println!("|---|---|---|---:|---:|---:|---:|---:|---:|");
+    for r in &rows {
+        println!("{r}");
+    }
+    println!();
+    println!("- Per-head stats cover the frame after each plane-update frame, as in `--suite`; `T_min` is that head's own.");
+    println!("- A cursor head is in only every {every}th commit (cursor `CRTC_X` move, no primary flip), so its `dt` is ≈ {every} × pace.");
+    println!("- `VRR=0` head: fixed refresh; `Delayed` there counts ordinary waits for the next fixed vblank, not VRR stalls.");
     Ok(())
 }
 
@@ -1298,7 +1890,10 @@ fn run(o: Options) -> Result<()> {
     if o.list {
         return list_displays(o.device.as_deref());
     }
-    if o.suite {
+    if o.dual_head {
+        return run_dual_head(o);
+    }
+    if o.suite || o.regression {
         return run_suite(o);
     }
     let mut disp = open_active_display(o.device.as_deref(), o.connector.as_deref())?;
@@ -1306,7 +1901,7 @@ fn run(o: Options) -> Result<()> {
     let (connector_id, connector_name, crtc, crtc_index) =
         (disp.connector_id, disp.connector_name, disp.crtc, disp.crtc_index);
     let m = crtc.mode;
-    let period_ns = (m.htotal as u64 * m.vtotal as u64 * 1_000_000) / m.clock.max(1) as u64;
+    let period_ns = frame_period_ns(&m);
     let refresh_hz = 1e9 / period_ns as f64;
     let pace_hz = o.pace_hz.unwrap_or(refresh_hz * 0.975);
     let pace_ns = (1e9 / pace_hz) as u64;
@@ -1321,41 +1916,14 @@ fn run(o: Options) -> Result<()> {
     let crtc_props = properties(fd, crtc.crtc_id, OBJ_CRTC)?;
     let vrr_prop = find(&crtc_props, "VRR_ENABLED");
 
-    // Primary and secondary planes for this CRTC.
-    let mut planes = drm_mode_get_plane_res::default();
-    ioctl(fd, 0xb5, &mut planes)?;
-    let mut ids = vec![0u32; planes.count_planes as usize];
-    planes.plane_id_ptr = ids.as_mut_ptr() as u64;
-    ioctl(fd, 0xb5, &mut planes)?;
-    let (mut primary, mut overlay, mut active) = (None, None, Vec::new());
-    for &id in &ids {
-        let mut p = drm_mode_get_plane { plane_id: id, ..Default::default() };
-        ioctl(fd, 0xb6, &mut p)?;
-        let mut formats = vec![0u32; p.count_format_types as usize];
-        p.format_type_ptr = formats.as_mut_ptr() as u64;
-        ioctl(fd, 0xb6, &mut p)?;
-        if p.possible_crtcs & (1 << crtc_index) == 0 || (p.crtc_id != 0 && p.crtc_id != crtc.crtc_id) {
-            continue;
-        }
-        let props = properties(fd, id, OBJ_PLANE)?;
-        if p.crtc_id == crtc.crtc_id {
-            active.push(id);
-        }
-        match find(&props, "type").map(|t| t.1) {
-            Some(1) if primary.is_none() && formats.contains(&XRGB8888) => primary = Some(Plane { id, props }),
-            Some(t) if t == o.update_plane_type && overlay.is_none() && formats.contains(&ARGB8888) => {
-                overlay = Some(Plane { id, props })
-            }
-            _ => {}
-        }
-    }
-    let primary = primary.ok_or("no primary plane with XRGB8888")?;
-    let overlay = overlay.ok_or(if o.update_plane_type == 2 {
-        "no cursor plane with ARGB8888"
+    let planes = crtc_planes(fd, crtc.crtc_id, crtc_index, &[])?;
+    let overlay = if o.update_plane_type == 2 {
+        planes.cursor.as_ref().ok_or("no cursor plane with ARGB8888")?
     } else {
-        "no overlay plane with ARGB8888"
-    })?;
-    let others: Vec<u32> = active.into_iter().filter(|&id| id != primary.id && id != overlay.id).collect();
+        planes.overlay.as_ref().ok_or("no overlay plane with ARGB8888")?
+    };
+    let others = planes.others(&[overlay.id]);
+    let primary = &planes.primary;
     let (ox, oy) = (o.overlay_pos.0.min(width.saturating_sub(ow + 16)), o.overlay_pos.1.min(height.saturating_sub(oh)));
 
     println!(
@@ -1379,23 +1947,7 @@ fn run(o: Options) -> Result<()> {
         eprintln!("warning: connector reports vrr_capable=0, VRR_ENABLED=1 will have no effect");
     }
 
-    let request = (100u64 << 8) | 0x1e; // SET_MASTER
-    if unsafe { libc::ioctl(fd, request as _) } < 0 {
-        return Err(format!(
-            "cannot become DRM master ({}); run from a spare VT without a compositor on this card",
-            io::Error::last_os_error()
-        )
-        .into());
-    }
-    let action = libc::sigaction {
-        sa_sigaction: on_signal as *const () as usize,
-        sa_mask: unsafe { std::mem::zeroed() },
-        sa_flags: 0,
-        sa_restorer: None,
-    };
-    for signal in [libc::SIGINT, libc::SIGTERM] {
-        unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) };
-    }
+    take_master(fd)?;
 
     let mut game = [
         Buffer::new(fd, width, height, XRGB8888, BACKGROUND)?,
@@ -1443,16 +1995,10 @@ fn run(o: Options) -> Result<()> {
 
     // First commit: full plane state plus VRR_ENABLED; later commits change FB_IDs/CRTC_X only.
     let mut setup = Atomic::default();
-    setup.object(primary.id, &plane_geometry(&primary, crtc.crtc_id, game[0].fb, width, height, 0, 0)?);
-    setup.object(overlay.id, &configure_secondary_state(&primary, &overlay, crtc.crtc_id, notification[0].fb, (ox, oy, ow, oh))?);
+    setup.object(primary.id, &plane_geometry(primary, crtc.crtc_id, game[0].fb, width, height, 0, 0)?);
+    setup.object(overlay.id, &configure_secondary_state(primary, overlay, crtc.crtc_id, notification[0].fb, (ox, oy, ow, oh))?);
     if !o.keep_planes {
-        for &id in &others {
-            let props = properties(fd, id, OBJ_PLANE)?;
-            let (Some((fb, _)), Some((crtc_prop, _))) = (find(&props, "FB_ID"), find(&props, "CRTC_ID")) else {
-                continue;
-            };
-            setup.object(id, &[(fb, 0), (crtc_prop, 0)]);
-        }
+        disable_planes(fd, &others, &mut setup)?;
     }
     if let (Some(value), Some((id, _))) = (o.vrr, vrr_prop) {
         setup.object(crtc.crtc_id, &[(id, value)]);
@@ -1522,7 +2068,7 @@ fn run(o: Options) -> Result<()> {
     // exits the kernel removes it, which turns the CRTC off until the compositor takes the
     // VT back and sets its mode again.
     let mut cleanup = Atomic::default();
-    cleanup.object(overlay.id, &disable_plane(&overlay)?);
+    cleanup.object(overlay.id, &disable_plane(overlay)?);
     if let (Some(_), Some((id, value))) = (o.vrr, vrr_prop) {
         cleanup.object(crtc.crtc_id, &[(id, value)]);
     }

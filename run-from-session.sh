@@ -16,6 +16,8 @@
 #
 #   ./run-from-session.sh                        # runs --suite (~42 s)
 #   ./run-from-session.sh --suite --connector DP-1
+#   ./run-from-session.sh --regression           # --suite + 5 regression cases (~77 s)
+#   ./run-from-session.sh --dual-head [--connector-b DP-1]   # two CRTCs per commit (~28 s)
 #   [SPARE_VT=8] [NO_BWRAP=1] ./run-from-session.sh --draw scene --seconds 30
 set -euo pipefail
 

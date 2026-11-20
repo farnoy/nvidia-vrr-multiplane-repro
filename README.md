@@ -27,17 +27,29 @@ List detected GPUs, active connectors, and `vrr_capable` (safe inside a graphica
 ./target/release/drm-plane-bench --list
 ```
 
-Run the 6-case suite from a terminal inside a graphical session (`run-from-session.sh` uses `sudo` only for VT switch / fbcon / temporary DRM ACLs; the binary itself runs unprivileged and sandboxed with `bwrap` when available):
+Three report modes, each printing a Markdown report (7 s per case, pace 83% of refresh — of the slower head in `--dual-head`; override with `--seconds` / `--pace-hz`):
+
+| Mode | Cases | Purpose |
+|---|---|---|
+| `--suite` (default of `run-from-session.sh`, ~42 s) | 6 | Quick repro: `solid` / `hstripes` controls, `vstripes` full / top half with overlay swap, cursor move, single-plane `--exclusive` control |
+| `--regression` (~77 s) | 11 | Single-head full matrix: the 6 `--suite` cases plus `vstripes` overlay move (`Window 0 + Window 1 + WindowIMM` interlock), overlay move `--exclusive` (standalone `WindowIMM`), cursor FB swap (`Core + Window 0`), cursor-only updates on an otherwise idle primary (`Core`-only unstall; primary-only column `—`), and a `VRR=0` fixed-refresh control |
+| `--dual-head` (~28 s) | 4 | Two active CRTCs on one device updated in the **same** atomic commit (one flip event per CRTC): both VRR heads flipping, VRR flip + VRR cursor-only head (both ways), VRR head + fixed-refresh head. Head A is `--connector` (or auto), head B is `--connector-b` (default: the next active CRTC); per-head `dt`, `commit→flip` and delayed stats |
+
+`VRR_ENABLED` and secondary planes are restored on every CRTC at exit. Run from a terminal inside a graphical session (`run-from-session.sh` uses `sudo` only for VT switch / fbcon / temporary DRM ACLs; the binary itself runs unprivileged and sandboxed with `bwrap` when available):
 
 ```bash
 ./run-from-session.sh
 ./run-from-session.sh --suite --connector HDMI-A-1
+./run-from-session.sh --regression
+./run-from-session.sh --dual-head --connector HDMI-A-1 --connector-b DP-1
 ```
 
 Or run manually from a spare VT (`Ctrl+Alt+F3`, no compositor holding DRM master):
 
 ```bash
 ./target/release/drm-plane-bench --suite
+./target/release/drm-plane-bench --regression
+./target/release/drm-plane-bench --dual-head
 ./target/release/drm-plane-bench --draw hbar --pace-hz 80 --seconds 10
 ./target/release/drm-plane-bench --pattern vstripes --pattern-rect 0,0,3840,2160 --exclusive --pace-hz 80 --seconds 10
 ```
