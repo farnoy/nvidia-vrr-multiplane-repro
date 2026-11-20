@@ -1,0 +1,15 @@
+[package]
+name = "drm-plane-bench"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Minimal atomic KMS repro for NVIDIA VRR multi-plane commit stutter"
+
+[dependencies]
+drm-sys = "0.8"
+libc = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
